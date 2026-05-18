@@ -205,6 +205,7 @@ async def spawn_runner(
                 lambda: docker_client.containers.run(
                     image,
                     detach=True,
+                    user="root",
                     volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
                     environment=env,
                 ),
