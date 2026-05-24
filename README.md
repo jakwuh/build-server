@@ -1,104 +1,53 @@
 # build-server
 
-Shared GitHub Actions runner pool. Two components, mix and match per host.
+Self-hosted GitHub Actions runner pool, powered by [actions-runner-controller](https://github.com/actions/actions-runner-controller) (ARC) on single-node k3s.
+
+This repo holds the deployment scripts — the runtime is upstream ARC. Previously this repo held a custom Python orchestrator (`runner_pool/`); it was retired after migrating to ARC, which uses GitHub's **Just-in-Time runner configs** (each spawn is bound to one specific job, so no org-pool race).
 
 ## Architecture
 
 ```
-GitHub ──webhook──► GATEWAY ──┬── POST /spawn → RUNNER (local, 127.0.0.1:3001)
-                              │
-                              ├── POST /spawn → RUNNER on box-2
-                              │
-                              └── POST /spawn → RUNNER on box-N
+GitHub Actions broker ──long-poll──► ARC listener ─► ARC controller ─► k8s pod (JIT runner) ──► job
 ```
 
-| Component | Role |
-|---|---|
-| **gateway** | Single GitHub webhook entry. Polls each runner's `/capacity` and dispatches each job to whichever has the most free RAM. Tracks per-job SLA (queued→in_progress latency, alerts on breach). Periodically scans GitHub for orphan queued jobs and synthesises spawns. |
-| **runner** | Exposes `/capacity` and `/spawn`. Spawns ephemeral `github-runner` containers, watchdogs them, re-queues failed spawns. RAM-gated scheduler + dockerd semaphore prevent OOM and webhook-stampede. |
+One **scale-set** per (org, runner-image). On this host:
 
-**Single-host deploy:** run both on the same machine. Gateway on `:3000`, runner on `:3001`, `WORKERS=http://127.0.0.1:3001`. nginx reverse-proxies port 80 → gateway.
-
-**Multi-host deploy:** one gateway box, N runner boxes. Gateway's `WORKERS=http://runner-1,http://runner-2,...`.
-
-## Scheduler (runner-side)
-
-Single knob: `MIN_FREE_RAM_MB` (default 3072) — how much RAM to always keep free for OS + spike headroom.
-
-```python
-avail = mem_available_mb() - inflight_reservation
-if avail < MIN_FREE_RAM_MB:                       return False   # refuse
-if avail >= 2 * MIN_FREE_RAM_MB:                  return True    # burst
-if (now - last_spawn_at) < 15s:                    return False  # throttle (tight band)
-return True                                                      # tight ok
-```
-
-In-flight reservation: each recent spawn (last 60s) "owes" `MIN_FREE_RAM_MB` worth of allocation in the accounting. Prevents a webhook stampede from racing past the gate before kernel sees real allocation.
-
-Burst is also capped by a docker-daemon semaphore (= vCPU count) so `containers.run()` calls don't pile up at the unix socket.
-
-| MemAvailable (default MIN=3072) | behavior |
-|---|---|
-| < 3 GB | refuse → next worker / gateway pending queue |
-| 3–6 GB | tight, 1 spawn / 15s |
-| ≥ 6 GB | burst freely |
-
-## SLA alert (gateway-side)
-
-Measures `queued → in_progress` per `(org, job_id)` from GitHub webhooks. Alerts once via Telegram if the gap exceeds `LATENCY_ALERT_S` (default 300s).
-
-## Runner image per job
-
-Add a `runner-image:` label to `runs-on` to use a custom image:
-
-```yaml
-runs-on: [self-hosted, runner-image:ghcr.io/my-org/my-runner:latest]
-```
-
-Jobs without this label use `DEFAULT_RUNNER_IMAGE` from the runner's `.env`.
+| Namespace | Scale-set name | Image | Used by `runs-on:` |
+|---|---|---|---|
+| `arc-izi-x` | `izi-x-linux` | `ghcr.io/actions/actions-runner:latest` | `izi-x-linux` |
+| `arc-izi-x` | `izi-x-flutter` | `ghcr.io/izi-x/actions-runner-flutter:latest` | `izi-x-flutter` |
+| `arc-miraj` | `self-hosted` | `ghcr.io/actions/actions-runner:latest` | `self-hosted` |
+| `arc-miraj` | `miraj-e2e` | `ghcr.io/miraj-os/e2e-runner:1.52.0-node20` | `miraj-e2e` |
 
 ## Setup
 
-### 1. Provision each host
-
 ```bash
-ssh root@<HOST-IP>
-curl -fsSL https://raw.githubusercontent.com/jakwuh/build-server/main/setup.sh | bash
-cp /opt/build-server/.env.example /opt/build-server/.env
-# Fill in GITHUB_APP_*, WEBHOOK_SECRET (gateway), INTERNAL_SECRET, DEFAULT_RUNNER_IMAGE
+# Fresh host (24+ vCPU, 16+ GB RAM recommended for prod):
+ssh root@<HOST>
+bash <(curl -fsSL https://raw.githubusercontent.com/jakwuh/build-server/main/setup.sh)
 ```
 
-`setup.sh` installs both `build-server-gateway.service` and `build-server-runner.service`. Disable whichever you don't want for this host.
+`setup.sh` installs k3s + helm + ARC controller in `arc-systems`. Then run `scripts/deploy-scale-set.sh` for each scale-set you need.
 
-### 2a. Single-host (gateway + runner on one box)
+GitHub App webhook URL is **not used** — ARC pulls from GitHub's runner-broker via long-polling with App credentials.
+
+## Operations
 
 ```bash
-echo 'WORKERS=http://127.0.0.1:3001' >> /opt/build-server/.env
-systemctl start build-server-runner build-server-gateway
+# List scale-sets and pods
+kubectl get autoscalingrunnerset -A
+kubectl get pods -A | grep -E '^arc-'
+
+# Tail listener logs
+kubectl -n arc-systems logs -l app.kubernetes.io/component=runner-scale-set-listener -f
+
+# Bump max runners
+helm upgrade <release> -n <namespace> --reuse-values --set maxRunners=50 \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 ```
-
-### 2b. Multi-host (one gateway, N runners)
-
-On the **gateway** host:
-```bash
-systemctl disable --now build-server-runner   # optional, if gateway shouldn't also run jobs
-echo 'WORKERS=http://runner-1.internal:3001,http://runner-2.internal:3001' >> /opt/build-server/.env
-systemctl start build-server-gateway
-```
-
-On each **runner** host:
-```bash
-systemctl disable --now build-server-gateway  # runners don't talk to GitHub
-# Remove WEBHOOK_SECRET / WORKERS / LATENCY_ALERT_S / TELEGRAM_* from .env — runner-only.
-systemctl start build-server-runner
-```
-
-### 3. Connect an org
-
-Point your GitHub App's webhook URL at `http://<GATEWAY-IP>/webhook`. Install the App on each org.
 
 ## Tuning
 
-- **Lots of small linux jobs only?** Drop `MIN_FREE_RAM_MB` to ~1024 → higher density.
-- **Mostly android/e2e?** Raise to your largest-job peak (e.g. 4096).
-- **Host has swap?** Don't lean on it — swap protects from OOM-kill but not from thrash. Keep `MIN_FREE_RAM_MB` realistic.
+- **Per-host capacity**: limit via `maxRunners` per scale-set + pod template resource requests.
+- **Burst latency**: first pull of a runner image is slow (~1-2 min for large images like the flutter SDK). Subsequent spawns hit local cache and start in ~30s.
+- **Custom images**: must include `/home/runner/{run.sh,config.sh,bin,externals}` (standard GitHub Actions runner layout). Both `myoung34/github-runner`-based and `ghcr.io/actions/actions-runner`-based images work out of the box.

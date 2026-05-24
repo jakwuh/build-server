@@ -1,8 +1,0 @@
-fastapi==0.115.12
-uvicorn[standard]==0.34.3
-PyGithub==2.9.1
-PyJWT==2.12.1
-requests==2.34.2
-httpx==0.28.1
-docker==7.1.0
-cryptography==45.0.3
