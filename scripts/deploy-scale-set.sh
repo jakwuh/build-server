@@ -6,14 +6,17 @@
 #     scripts/deploy-scale-set.sh
 #
 # Examples:
-#   APP_ID=123 INSTALL_ID=456 ORG=izi-x NAME=izi-x-linux MAX=30 scripts/deploy-scale-set.sh
-#   APP_ID=123 INSTALL_ID=789 ORG=Miraj-OS NAME=miraj-e2e \
-#     IMAGE=ghcr.io/miraj-os/e2e-runner:1.52.0-node20 MAX=20 scripts/deploy-scale-set.sh
+#   APP_ID=123 INSTALL_ID=456 ORG=my-org NAME=my-org-linux MAX=20 \
+#     PRIVATE_KEY_FILE=/etc/build-server/my-org.pem scripts/deploy-scale-set.sh
+#
+#   APP_ID=123 INSTALL_ID=789 ORG=my-org NAME=my-org-e2e \
+#     IMAGE=ghcr.io/my-org/e2e-runner:latest MAX=10 \
+#     PRIVATE_KEY_FILE=/etc/build-server/my-org.pem scripts/deploy-scale-set.sh
 set -euo pipefail
 
 : "${APP_ID:?GITHUB_APP_ID required}"
 : "${INSTALL_ID:?GITHUB_APP_INSTALLATION_ID required}"
-: "${ORG:?ORG required (e.g. izi-x or Miraj-OS)}"
+: "${ORG:?ORG required (GitHub org or user)}"
 : "${NAME:?NAME required — scale-set name, must match runs-on: label in workflows}"
 : "${PRIVATE_KEY_FILE:?PRIVATE_KEY_FILE required — path to App's PEM file}"
 IMAGE="${IMAGE:-ghcr.io/actions/actions-runner:latest}"
