@@ -49,6 +49,12 @@ RUN ARCH="$(dpkg --print-architecture)"; \
  && /tmp/aws/install \
  && rm -rf /tmp/aws /tmp/awscliv2.zip
 
+# In CI we trust every repo we operate on. Disable git's "dubious ownership"
+# safety check (introduced in 2.35 by CVE-2022-24765). Without this, any step
+# that touches /opt/hostedtoolcache/... after a sudo apt install (which
+# changes mtimes/ownership) fails on `fatal: detected dubious ownership`.
+RUN git config --system --add safe.directory '*'
+
 # run.sh refuses to start as root when the sudo group has NOPASSWD ALL
 # (which the upstream actions-runner ships). Switch back to runner explicitly.
 USER runner
