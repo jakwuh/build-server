@@ -2,7 +2,9 @@
 
 Self-hosted GitHub Actions runner pool on a single host, powered by upstream [actions-runner-controller](https://github.com/actions/actions-runner-controller) (ARC) on k3s. ARC uses GitHub's **Just-in-Time runner configs** — each pod is bound to one specific job, so there is no shared org pool and no spawn race.
 
-This repo is the deploy scaffolding only (bootstrap script + per-scale-set helper). The runtime is upstream ARC; runner images are owned by the projects that consume them.
+This repo provides:
+- Deploy scaffolding (`setup.sh`, `scripts/deploy-scale-set.sh`).
+- A reference generic runner image at `ghcr.io/jakwuh/actions-runner:latest` (Dockerfile in `runner-image/`). It's an upstream `actions-runner` + the minimum CLI toolkit (`gh`, `aws`, `jq`, `git`, `curl`, `unzip`, `zip`, `xz`, `rsync`, `gnupg`) — everything else (Node, Java, Flutter, Playwright, Android SDK, Python …) is installed on demand by workflow steps via `setup-*` actions, cached through `actions/cache`. Use this for every scale-set unless you have a reason not to.
 
 ## Architecture
 
@@ -37,9 +39,9 @@ scripts/deploy-scale-set.sh
 
 The GitHub App webhook URL is **not used** — ARC pulls from GitHub's runner broker via long-polling with the App credentials.
 
-## Custom runner images
+## Runner image contract
 
-This repo does not ship runner images. Each project owns its image; the contract for ARC's DinD container mode is:
+The reference image (`runner-image/`) and any custom image you want to use must satisfy ARC's DinD container mode:
 
 1. **Base on `ghcr.io/actions/actions-runner:latest`** (or any image that ships the upstream runner layout). That gets you everything below for free.
 2. **`/home/runner/{run.sh,config.sh,bin,externals,k8s,env.sh,...}`** must be present. The chart's `init-dind-externals` init container `cp -r`s from `/home/runner/externals`; the runner container `exec`s `/home/runner/run.sh`. Missing either → `Init:Error` or `OCI runtime ... no such file or directory`.
