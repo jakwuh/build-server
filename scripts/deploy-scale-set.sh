@@ -29,8 +29,8 @@ MIN="${MIN:-1}"
 # "weightless" → CPU contention → dind's managed containerd misses its 15s
 # startup window → dind exits 1, runner hangs Running (1/2 Error forever),
 # build times climb. Sized from p90 of live builds (runner 1.6 cores / 0.9Gi).
-CPU_REQUEST="${CPU_REQUEST:-2}"
-MEM_REQUEST="${MEM_REQUEST:-3Gi}"
+CPU_REQUEST="${CPU_REQUEST:-1}"
+MEM_REQUEST="${MEM_REQUEST:-1.5Gi}"
 
 NS="arc-$(echo "$ORG" | tr '[:upper:]' '[:lower:]')"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
