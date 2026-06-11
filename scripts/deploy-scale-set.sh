@@ -22,6 +22,15 @@ set -euo pipefail
 IMAGE="${IMAGE:-ghcr.io/actions/actions-runner:latest}"
 MAX="${MAX:-20}"
 MIN="${MIN:-0}"
+# Per-runner CPU/memory *requests* (no limits → burstable). These gate the
+# k8s scheduler so it never packs more concurrent dind builds onto the node
+# than it has capacity for. Without them the scheduler treats every pod as
+# weightless and overpacks → dind's managed containerd misses its startup
+# window under contention → dind exits 1, the runner container hangs Running
+# forever (pod stuck 1/2 Error), build times climb. Set to the measured
+# per-build footprint of your heaviest workflow.
+CPU_REQUEST="${CPU_REQUEST:-2}"
+MEM_REQUEST="${MEM_REQUEST:-3Gi}"
 
 NS="arc-$(echo "$ORG" | tr '[:upper:]' '[:lower:]')"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -46,6 +55,8 @@ helm upgrade --install "$NAME" \
   --set "template.spec.containers[0].name=runner" \
   --set "template.spec.containers[0].image=$IMAGE" \
   --set "template.spec.containers[0].command={/home/runner/run.sh}" \
+  --set "template.spec.containers[0].resources.requests.cpu=$CPU_REQUEST" \
+  --set "template.spec.containers[0].resources.requests.memory=$MEM_REQUEST" \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
 kubectl -n "$NS" get autoscalingrunnerset
