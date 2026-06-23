@@ -21,6 +21,17 @@ if ! command -v k3s >/dev/null 2>&1; then
 fi
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
+echo "=== MSS clamp (flannel VXLAN MTU blackhole fix) ==="
+# k3s flannel runs at MTU 1450 while the CI build bridges default to 1500;
+# without this, bulk container egress blackholes (see mss-clamp.sh header).
+RAW=https://raw.githubusercontent.com/jakwuh/build-server/main
+install -d /opt/build-server
+curl -fsSL "$RAW/systemd/build-server-mss-clamp.sh" -o /opt/build-server/mss-clamp.sh
+chmod +x /opt/build-server/mss-clamp.sh
+curl -fsSL "$RAW/systemd/build-server-mss-clamp.service" -o /etc/systemd/system/build-server-mss-clamp.service
+systemctl daemon-reload
+systemctl enable --now build-server-mss-clamp.service
+
 echo "=== Helm ==="
 if ! command -v helm >/dev/null 2>&1; then
   curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
