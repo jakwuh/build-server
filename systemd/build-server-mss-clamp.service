@@ -1,0 +1,15 @@
+[Unit]
+Description=Clamp TCP MSS for CI container egress (flannel VXLAN MTU blackhole fix)
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/build-server/mss-clamp.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
