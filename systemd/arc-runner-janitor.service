@@ -1,0 +1,10 @@
+[Unit]
+Description=Reap ARC runner pods whose dind sidecar died
+After=k3s.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/build-server/arc-runner-janitor.sh
+StandardOutput=journal
+StandardError=journal

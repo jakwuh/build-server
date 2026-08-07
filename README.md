@@ -49,6 +49,26 @@ The reference image (`runner-image/`) and any custom image you want to use must 
 
 `myoung34/github-runner` does **not** satisfy any of the above. It has no `run.sh`, no `externals/`, and its `docker` group is GID 500. Don't use it as a base — there's no clean ARC-DinD adapter that doesn't end up being a wrapper image with the missing pieces re-copied in.
 
+## Not in this repo
+
+`setup.sh` gets a fresh box to a working pool, but it cannot produce these. Check them off by
+hand when you rebuild or move the host, or the box will come up looking healthy and quietly
+serving nothing:
+
+| What | Where it comes from |
+|---|---|
+| Tailnet membership + the `tag:buildsrv` tag | `tailscale up --authkey` with an auth key from 1Password; the tag is what the tailnet policy grants on |
+| Tailnet grants to reach the clusters | the tailnet ACL (`tag:buildsrv` → `tag:k8s-operator`, impersonating a group that RBAC binds inside the target cluster) |
+| `github-app` secret in each `arc-*` namespace | GitHub App **jakwuh-build-server** (app id, installation id, private key) — the same App the runner healthcheck mints tokens from |
+| `ghcr-pull` secret in each `arc-*` namespace | a ghcr read token, for the custom runner image |
+| `/etc/arc-watchdog/{tg-token,config}` | alerts bot token + chat id; without them the watchdog heals silently |
+| Anything izi-x-specific | lives in `izi-x/izi-x-infra`, not here — e.g. `ops/pr-stand-janitor` |
+
+The rule for what belongs where: this repo is the **build server as a machine** — the pool,
+the image, the things that keep the pool alive. Anything that knows about a particular
+product's clusters, namespaces or databases belongs to that product's repo, even when it
+physically runs on this host.
+
 ## Self-heal watchdog
 
 `scripts/arc-watchdog.sh` (installed by `setup.sh` as an `arc-watchdog.timer` firing every
@@ -67,10 +87,17 @@ Telegram if `/etc/arc-watchdog/tg-token` (chmod 600) and `TG_CHAT=` in `/etc/arc
 are present. Without those it heals silently.
 
 ```bash
-systemctl list-timers arc-watchdog.timer
+systemctl list-timers arc-watchdog.timer arc-runner-janitor.timer
 journalctl -u arc-watchdog.service --since -1h
 /opt/build-server/arc-watchdog.sh          # run once by hand; silence == healthy
 ```
+
+`scripts/arc-runner-janitor.sh` (every 5 minutes) covers the neighbouring failure: the dind
+sidecar exits while the runner container keeps running, so the pod sits at `1/2 Error`
+forever — taking no work, holding its CPU requests. Enough of them and the node hits its
+requests ceiling, the next dind's containerd misses its startup window and becomes another
+zombie. That loop stalled CI on 2026-08-06 after a reboot: 23 queued runs against a pool that
+looked healthy. Deleting the pod is safe — ARC recreates it, GitHub re-assigns the job.
 
 ## Operations
 
