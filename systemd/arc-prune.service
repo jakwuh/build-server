@@ -1,0 +1,17 @@
+[Unit]
+Description=Prune containerd/docker images and vacuum the journal
+After=k3s.service
+
+[Service]
+Type=oneshot
+User=root
+# Runner images are pulled by containerd (k3s), not by the host docker — that is
+# where disk actually goes. The docker lines are cheap insurance in case a job
+# ever builds on the host; today the host daemon holds zero images.
+ExecStart=/usr/local/bin/k3s crictl rmi --prune
+ExecStart=-/usr/bin/docker system prune -af --filter until=48h
+ExecStart=-/usr/bin/docker builder prune -af --filter until=48h
+ExecStart=-/usr/bin/docker volume prune -af
+ExecStart=/usr/bin/journalctl --vacuum-time=7d
+StandardOutput=journal
+StandardError=journal
