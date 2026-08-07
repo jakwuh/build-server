@@ -45,5 +45,17 @@ helm upgrade --install arc \
 echo "=== Wait for controller ==="
 kubectl -n arc-systems rollout status deploy/arc-gha-rs-controller --timeout=120s
 
+echo "=== ARC self-heal watchdog ==="
+# A wedged controller or a listener pointed at a deleted EphemeralRunnerSet leaves
+# every pool dead with zero red checks — jobs just queue. See arc-watchdog.sh header.
+curl -fsSL "$RAW/scripts/arc-watchdog.sh" -o /opt/build-server/arc-watchdog.sh
+chmod +x /opt/build-server/arc-watchdog.sh
+curl -fsSL "$RAW/systemd/arc-watchdog.service" -o /etc/systemd/system/arc-watchdog.service
+curl -fsSL "$RAW/systemd/arc-watchdog.timer" -o /etc/systemd/system/arc-watchdog.timer
+systemctl daemon-reload
+systemctl enable --now arc-watchdog.timer
+
 echo
 echo "ARC installed. Deploy scale-sets with: scripts/deploy-scale-set.sh"
+echo "Self-heal announces repairs to Telegram if you drop a bot token in"
+echo "/etc/arc-watchdog/tg-token and TG_CHAT=... in /etc/arc-watchdog/config."

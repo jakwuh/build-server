@@ -49,6 +49,29 @@ The reference image (`runner-image/`) and any custom image you want to use must 
 
 `myoung34/github-runner` does **not** satisfy any of the above. It has no `run.sh`, no `externals/`, and its `docker` group is GID 500. Don't use it as a base — there's no clean ARC-DinD adapter that doesn't end up being a wrapper image with the missing pieces re-copied in.
 
+## Self-heal watchdog
+
+`scripts/arc-watchdog.sh` (installed by `setup.sh` as an `arc-watchdog.timer` firing every
+3 minutes) exists because ARC can die in ways that produce **no red check anywhere** — jobs
+simply queue forever. Both of these happened for real on 2026-08-06/07 after a GitHub Actions
+outage and cost ~12 hours:
+
+- the `AutoscalingListener` CR keeps pointing at a deleted `EphemeralRunnerSet`, so the
+  listener pod crash-loops on `could not patch ephemeral runner set ... not found`;
+- the controller wedges outright (log frozen mid `deleting runner scale set`) and no listener
+  is created at all.
+
+The watchdog heals on the second consecutive unhealthy check — deleting the stale listener CR
+in the first case, restarting the controller in the second — and announces what it did to
+Telegram if `/etc/arc-watchdog/tg-token` (chmod 600) and `TG_CHAT=` in `/etc/arc-watchdog/config`
+are present. Without those it heals silently.
+
+```bash
+systemctl list-timers arc-watchdog.timer
+journalctl -u arc-watchdog.service --since -1h
+/opt/build-server/arc-watchdog.sh          # run once by hand; silence == healthy
+```
+
 ## Operations
 
 ```bash
