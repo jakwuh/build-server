@@ -133,7 +133,14 @@ spec:
           restartPolicy: Never
           containers:
             - name: gc
-              image: mirror.gcr.io/library/bitnami/kubectl:latest
+              # bitnami/kubectl disappeared from public registries in 2025 (Bitnami moved
+              # its images to bitnamilegacy), so this tag stopped resolving and the GC
+              # CronJob sat in ImagePullBackOff from 2026-06-14 until 2026-08-07 —
+              # silently, because a CronJob that cannot start a pod raises nothing.
+              # registry.k8s.io/kubectl and rancher/kubectl are distroless — no
+              # /bin/sh, and this job is a shell script, so they fail at container
+              # init. alpine/kubectl ships both. Pinned to the k3s minor.
+              image: docker.io/alpine/kubectl:1.35.0
               command: ["/bin/sh","-c"]
               args:
                 - |
@@ -162,12 +169,17 @@ metadata:
   name: registry-gc
   namespace: registry-cache
 rules:
+  # pods/attach: `kubectl run -i` attaches to the one-shot GC pod. Without it the
+  # job still works (it falls back to streaming logs) but prints a scary
+  # "forbidden" warning that hides real failures.
   - apiGroups: [""]
-    resources: ["pods", "pods/log"]
+    resources: ["pods", "pods/log", "pods/attach"]
     verbs: ["get","list","watch","create","delete"]
+  # watch: `kubectl rollout status` watches the deployment. Without it the job
+  # degrades to polling and spams a reflector error on every retry.
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get","list","patch"]
+    verbs: ["get","list","watch","patch"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get","patch","update"]
