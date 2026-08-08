@@ -24,13 +24,19 @@ set -euo pipefail
 IMAGE="${IMAGE:-ghcr.io/jakwuh/actions-runner:latest}"
 MAX="${MAX:-8}"
 MIN="${MIN:-1}"
-# Per-runner CPU/memory requests (no limits → burstable). These bound the
-# scheduler so it never overpacks dind pods — without them every pod is
+# Per-container CPU/memory requests (no limits → burstable). These bound the
+# scheduler so it never overpacks the node — without them a container is
 # "weightless" → CPU contention → dind's managed containerd misses its 15s
 # startup window → dind exits 1, runner hangs Running (1/2 Error forever),
-# build times climb. Sized from p90 of live builds (runner 1.6 cores / 0.9Gi).
+# build times climb. The dind container is the one that runs dockerd + that
+# managed containerd (and every `docker build`), so it MUST carry its OWN
+# request — a requested runner sitting next to a weightless dind still lets the
+# scheduler overpack dind and starve containerd at startup. Sized from p90 of
+# live builds (runner 1.6 cores / 0.9Gi).
 CPU_REQUEST="${CPU_REQUEST:-1}"
 MEM_REQUEST="${MEM_REQUEST:-1.5Gi}"
+DIND_CPU_REQUEST="${DIND_CPU_REQUEST:-1}"
+DIND_MEM_REQUEST="${DIND_MEM_REQUEST:-1.5Gi}"
 
 NS="arc-$(echo "$ORG" | tr '[:upper:]' '[:lower:]')"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -91,6 +97,10 @@ template:
       - --registry-mirror=https://mirror.gcr.io
       securityContext:
         privileged: true
+      resources:
+        requests:
+          cpu: "$DIND_CPU_REQUEST"
+          memory: $DIND_MEM_REQUEST
       volumeMounts:
       - { mountPath: /home/runner/_work, name: work }
       - { mountPath: /var/run, name: dind-sock }
