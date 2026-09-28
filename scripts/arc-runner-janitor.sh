@@ -11,6 +11,12 @@
 #
 # Deleting the pod is safe: ARC recreates it and GitHub re-assigns the job.
 #
+# The same zombie also shows as StartError: dind never started at all ("failed to
+# create containerd task: ... context canceled"). On 2026-09-27 23:43 UTC a k3s
+# apiserver/kine stall left two izi-x-linux pods 1/2 StartError for ~3h. This
+# script only matched "Error", so it skipped them. ARC kept counting them as live
+# runners, and jobs waited up to ~1h with no runner online.
+#
 # Covers every arc-* namespace, not just one — both scale sets live on this box
 # and either can produce the zombie.
 set -uo pipefail
@@ -22,7 +28,7 @@ namespaces=$("$KUBECTL" get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\
 [ -n "$namespaces" ] || { echo "no arc-* runner namespaces found (cluster unreachable?)" >&2; exit 0; }
 
 for ns in $namespaces; do
-  stuck=$("$KUBECTL" -n "$ns" get pods --no-headers 2>/dev/null | awk '$3 == "Error" { print $1 }')
+  stuck=$("$KUBECTL" -n "$ns" get pods --no-headers 2>/dev/null | awk '$3 == "Error" || $3 == "StartError" { print $1 }')
   [ -n "$stuck" ] || continue
   echo "$ns: $(echo "$stuck" | wc -w) stuck runner(s), deleting: $stuck"
   # shellcheck disable=SC2086 # word splitting is the point — one pod per arg
