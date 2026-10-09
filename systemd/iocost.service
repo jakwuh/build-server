@@ -1,0 +1,16 @@
+[Unit]
+Description=Enable blk-iocost on the CI disk with its measured cost model
+Before=k3s.service
+ConditionPathExists=/etc/iocost.model
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# /etc/iocost.model is the output of the kernel's tools/cgroup/iocost_coef_gen.py run on
+# this disk (README, "Tier isolation"); without a model of the device iocost would cap the
+# disk at a default it does not match. QoS stays at the kernel's defaults (no latency
+# targets): the controller scales the issue rate by the device's own saturation state.
+ExecStart=/bin/sh -c 'cat /etc/iocost.model > /sys/fs/cgroup/io.cost.model && echo "$(cut -d" " -f1 /etc/iocost.model) enable=1" > /sys/fs/cgroup/io.cost.qos'
+
+[Install]
+WantedBy=multi-user.target

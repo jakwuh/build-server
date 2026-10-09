@@ -11,7 +11,7 @@
 #
 # Endpoint: tcp://buildkitd.arc-izi-x.svc.cluster.local:1234 — reachable from arc-izi-x
 # only (NetworkPolicy below): the daemon is unauthenticated and its cache holds izi-x code.
-# Cache: hostPath /opt/buildkit-cache-izi-x, GC keeps it under ~40GB.
+# Cache: hostPath /opt/buildkit-cache-izi-x, GC keeps it under ~20GB (sizing below).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -27,7 +27,13 @@ data:
     [worker.oci]
       enabled = true
       gc = true
-      gckeepstorage = 40000000000
+      # Shared by both daemons. Records reused at least once were 12.3 GB (PR) and 4.8 GB
+      # (trusted) of 40 GB each on 2026-10-08; the rest had been used once. 20 GB holds
+      # the reused set plus ≥ 7.7 GB of fresh records — more than the largest single
+      # build. At 40 GB the two caches kept the disk at 84%, just under the kubelet's
+      # 85% image-GC threshold: 97 image removals in 13 h, every job image pulled again
+      # (55 GB written by containerd). At 2 × 20 GB the disk sits near 63%.
+      gckeepstorage = 20000000000
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -44,6 +50,7 @@ spec:
     metadata:
       labels: { app: buildkitd }
     spec:
+      priorityClassName: ci-infra
       containers:
         - name: buildkitd
           image: mirror.gcr.io/moby/buildkit:v0.30.0

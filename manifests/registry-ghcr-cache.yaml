@@ -1,0 +1,76 @@
+# Pull-through cache for ghcr.io (the runner image ghcr.io/jakwuh/actions-runner and the
+# ARC images), next to registry-cache.yaml's docker.io one. Was applied by hand; this is
+# the live object exported from bld1 on 2026-10-08, plus the ci-infra priority.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-ghcr-config
+  namespace: registry-cache
+data:
+  config.yml: |
+    version: 0.1
+    log:
+      fields:
+        service: registry
+    storage:
+      filesystem:
+        rootdirectory: /var/lib/registry
+      delete:
+        enabled: true
+      cache:
+        blobdescriptor: inmemory
+    http:
+      addr: :5000
+    proxy:
+      remoteurl: https://ghcr.io
+    health:
+      storagedriver:
+        enabled: true
+        interval: 10s
+        threshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-ghcr
+  namespace: registry-cache
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: registry-ghcr }
+  template:
+    metadata:
+      labels: { app: registry-ghcr }
+    spec:
+      priorityClassName: ci-infra
+      containers:
+        - name: registry
+          image: mirror.gcr.io/library/registry:2
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet: { path: /v2/, port: 5000 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+          volumeMounts:
+            - { mountPath: /var/lib/registry, name: storage }
+            - { mountPath: /etc/docker/registry/config.yml, name: config, subPath: config.yml }
+      volumes:
+        - name: storage
+          hostPath: { path: /var/lib/registry-ghcr-cache, type: DirectoryOrCreate }
+        - name: config
+          configMap: { name: registry-ghcr-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-ghcr
+  namespace: registry-cache
+spec:
+  selector: { app: registry-ghcr }
+  ports:
+    - port: 5000
+      targetPort: 5000

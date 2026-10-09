@@ -91,47 +91,103 @@ Image builds run on two persistent buildkitd: `buildkitd` (PR code,
 `vars.TRUSTED_BUILDKIT_ENDPOINT`) — a cache mount shared with PR code could poison a prod
 image. arm64 runs through the host's binfmt (`qemu-user-static`, setup.sh).
 
-Sizes are measured per container on bld1 on 2026-10-07 (`host="bld1"` in the dev
-VictoriaMetrics): small jobs ≤613 MiB / ≤1.73 cores; validate-crm 6.0 GiB at its 6Gi limit
-and 4.1 cores, mobile checks 3.6 GiB / 3.3 cores; migrations compat ≤1346 MiB.
+Sizing — below the table.
 
 | scale set | tier | PriorityClass | runner req → lim | job pod req → lim | MAX |
 | --- | --- | --- | --- | --- | --- |
-| `izi-x-pr-small` | pr | — | 250m/512Mi → 2/1Gi | — | 20 |
-| `izi-x-pr-heavy` | pr | — | 2/4Gi → 4/6Gi | — | 6 |
-| `izi-x-pr-k8s` | pr | — | 100m/256Mi → 1/1Gi | 1/2Gi → 4/6Gi | 6 |
-| `izi-x-main-small` | main | `ci-main` | 250m/512Mi → 2/1Gi | — | 3 |
-| `izi-x-main-heavy` | main | `ci-main` | 2/4Gi → 4/6Gi | — | 4 |
-| `izi-x-main-k8s` | main | `ci-main` | 100m/256Mi → 1/1Gi | 1/2Gi → 4/6Gi | 2 |
-| `izi-x-release-small` | release | `ci-release` | 250m/512Mi → 2/1Gi | — | 4 |
-| `izi-x-release-large` | release | `ci-release` | 2/4Gi → 4/6Gi | — | 5 |
+| `izi-x-pr-small` | pr (idle) | — | 10m/512Mi → 2/1Gi | — | 48 |
+| `izi-x-pr-heavy` | pr (idle) | — | 10m/6Gi → 4/6Gi | — | 9 |
+| `izi-x-pr-k8s` | pr (idle) | — | 100m/256Mi → 1/1Gi | 10m/1.5Gi → 4/6Gi | 16 |
+| `izi-x-pr-required` | pr | `ci-pr-required` | 2/4.5Gi → 4/6Gi | — | 7 |
+| `izi-x-pr-required-small` | pr | `ci-pr-required` | 50m/512Mi → 2/1Gi | — | 6 |
+| `izi-x-main-small` | main | `ci-main` | 100m/512Mi → 2/1Gi | — | 22 |
+| `izi-x-main-heavy` | main | `ci-main` | 2/6Gi → 4/6Gi | — | 5 |
+| `izi-x-main-k8s` | main | `ci-main` | 100m/256Mi → 1/1Gi | 1/6Gi → 4/6Gi | 1 |
+| `izi-x-release-small` | release | `ci-release` | 50m/512Mi → 2/1Gi | — | 17 |
+| `izi-x-release-large` | release | `ci-release` | 2/6Gi → 4/6Gi | — | 3 |
+
+Sizing, from 2026-10-08 (GitHub jobs API: queue and run times of every job; cAdvisor: CPU and
+memory per job; job budget = allocatable − non-job requests = 17.4 CPU, 50.3 GiB):
+
+- Memory request = p95 working set of the pool's jobs. Below it the kubelet evicts work under
+  pressure; above it memory sits reserved and unused. The scheduler then packs by real memory
+  and hands freed memory to the Pending queue in priority order.
+- CPU request = the mean cores a job of the pool uses; optional PR pools 10m (`cpu.idle`).
+- Priority pools: MAX = peak demand (queued + running). Their joint peak — 16.4 CPU of
+  requests, 31.6 GB of real memory — fits the budget, so they never wait on a ceiling.
+- Optional PR pools: MAX = min(17.4 CPU / mean cores per job, peak demand) — past CPU saturation
+  more pods only wait. pr-heavy min(9, 24), pr-k8s min(60, 16), pr-small min(96, 48).
+- meta and the validate gates (7–9 s) have `izi-x-pr-required-small`: in `izi-x-pr-required`
+  they held 309 of 478 slots of 2 CPU / 4 GiB that validate waited for.
+
+## Tier isolation
+
+PriorityClasses order only the Pending queue (`preemptionPolicy: Never`); a running optional PR job
+used to share CPU with a release build by requests and the disk equally. Now:
+
+- `scripts/ci-tier-weights.sh` (`ci-tier-weights.service`) puts every optional PR pod — pr-small,
+  pr-heavy, pr-k8s and their `-workflow` pods, and the PR buildkitd — into the idle tier on its pod
+  slice through systemd: `CPUWeight=idle` (cpu.idle — runs only on CPU no other pod wants) and
+  `IOWeight=1` (others 100). A direct write to the cgroup file does not hold: systemd re-applies a
+  slice's properties whenever a container scope starts under it.
+- `iocost.service` enables blk-iocost on `sda` at boot with `/etc/iocost.model`, the output of the
+  kernel's `tools/cgroup/iocost_coef_gen.py` run on this disk with no jobs running:
+  `python3 iocost_coef_gen.py --testfile-size-gb 16 > /etc/iocost.model`. bld1, 2026-10-09 01:45 UTC:
+  `8:0 rbps=810426024 rseqiops=23498 rrandiops=7315 wbps=127570737 wseqiops=11981 wrandiops=3735`.
+  The model sets the relative cost of IO kinds; the QoS stays at the kernel's defaults, so the
+  controller scales the issue rate by the device's own saturation state.
+- Optional PR pools request `CPU_REQUEST=10m`: their CPU is bounded by `cpu.idle`, not by the
+  scheduler, so a PR reservation can no longer keep a main/release pod Pending. pr-heavy `MAX=9`:
+  the job budget of 17.4 CPU over 1.83 cores per pr-heavy job (2026-10-08) — past that more pods
+  only wait. main-small / release-small request the average they use (0.06 / 0.03 cores; they
+  wait on buildkitd), rounded up to 50m.
+- CPU limits stay: Node, Go and Gradle size their worker pools from `cpu.max`.
+
+Required PR checks (validate api/crm, behind the merge gates) have their own pool,
+`izi-x-pr-required`, at `ci-pr-required`: ahead of every optional PR job (mobile checks, compat,
+schema audit), behind main and release.
+
+Listeners, buildkitd and the registry cache run at `ci-infra` (above every job, never
+preempting): otherwise a listener recreated by a pool upgrade waits Pending behind jobs on a
+full node and its pool takes nothing meanwhile.
 
 All izi-x pools run with `DIND_EXTERNALS=false` and `CI_HOST_CACHE=true`
-(`scripts/install-ci-host-cache.sh` must have run on the node first). Service containers of
+(`scripts/install-ci-host-cache.sh` must have run on the node first). `CACHE_TIER` is `pr` for the
+PR pools and `trusted` for main/release, and every host cache exists once per tier under
+`/opt/ci-tier/<tier>`: PR code runs as the same uid as trusted jobs, and the toolcache (node,
+flutter), pub (it checks a package against its stored hash file, not the unpacked files) and
+build_runner output are all executed by release builds. npm's cacache is content-verified on read,
+but it is split too, for one rule instead of a per-cache exception. Jobs link `node_modules` to a
+tree installed once per package-lock in `/ci-cache/node_modules` (izi-x
+`.github/actions/node-modules`): on 2026-10-08 the per-job copies (690 MB / 70k files for api or
+crm, ~280 GB of ~1 TB in 7 h) were the disk's write ceiling. Service containers of
 `k8s` jobs get the `manifests/limitrange-arc-izi-x.yaml` defaults.
 
 ```bash
-# First: kubectl apply -f manifests/runner-priority-classes.yaml manifests/limitrange-arc-izi-x.yaml
+# First: kubectl apply -f manifests/runner-priority-classes.yaml -f manifests/limitrange-arc-izi-x.yaml
 COMMON="APP_ID=3743839 INSTALL_ID=133105803 ORG=izi-x NAMESPACE=arc-izi-x IMAGE=ghcr.io/jakwuh/actions-runner:<sha> PRIVATE_KEY_FILE=<app>.pem DIND_EXTERNALS=false CI_HOST_CACHE=true"
 SMALL="DIND=false CPU_REQUEST=250m MEM_REQUEST=512Mi CPU_LIMIT=2 MEM_LIMIT=1Gi WORK_SIZE=4Gi"
-HEAVY="DIND=false CPU_REQUEST=2 MEM_REQUEST=4Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=16Gi"
+HEAVY="DIND=false CPU_REQUEST=2 MEM_REQUEST=6Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=16Gi"
 K8S="DIND=false CONTAINER_MODE=kubernetes-novolume CPU_REQUEST=1 MEM_REQUEST=2Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=8Gi"
-env $COMMON $SMALL NAME=izi-x-pr-small      MIN=1 MAX=20 scripts/deploy-scale-set.sh
-env $COMMON $HEAVY NAME=izi-x-pr-heavy      MIN=0 MAX=6  scripts/deploy-scale-set.sh
-env $COMMON $K8S   NAME=izi-x-pr-k8s        MIN=0 MAX=6  scripts/deploy-scale-set.sh
-env $COMMON $SMALL NAME=izi-x-main-small    MIN=0 MAX=3  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
-env $COMMON $HEAVY NAME=izi-x-main-heavy    MIN=0 MAX=4  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
-env $COMMON $K8S   NAME=izi-x-main-k8s      MIN=0 MAX=2  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
-env $COMMON $SMALL NAME=izi-x-release-small MIN=0 MAX=4  PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
-env $COMMON $HEAVY NAME=izi-x-release-large MIN=0 MAX=5  PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
+env $COMMON $SMALL CPU_REQUEST=10m  NAME=izi-x-pr-small          MIN=1 MAX=48 CACHE_TIER=pr scripts/deploy-scale-set.sh
+env $COMMON $HEAVY CPU_REQUEST=10m  NAME=izi-x-pr-heavy          MIN=0 MAX=9  CACHE_TIER=pr scripts/deploy-scale-set.sh
+env $COMMON $K8S   CPU_REQUEST=10m MEM_REQUEST=1536Mi NAME=izi-x-pr-k8s MIN=0 MAX=16 CACHE_TIER=pr scripts/deploy-scale-set.sh
+env $COMMON $HEAVY MEM_REQUEST=4608Mi NAME=izi-x-pr-required     MIN=0 MAX=7  CACHE_TIER=pr PRIORITY_CLASS=ci-pr-required scripts/deploy-scale-set.sh
+env $COMMON $SMALL CPU_REQUEST=50m  NAME=izi-x-pr-required-small MIN=0 MAX=6  CACHE_TIER=pr PRIORITY_CLASS=ci-pr-required scripts/deploy-scale-set.sh
+env $COMMON $SMALL CPU_REQUEST=100m NAME=izi-x-main-small        MIN=0 MAX=22 CACHE_TIER=trusted PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $HEAVY                  NAME=izi-x-main-heavy        MIN=0 MAX=5  CACHE_TIER=trusted PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $K8S   MEM_REQUEST=6Gi  NAME=izi-x-main-k8s          MIN=0 MAX=1  CACHE_TIER=trusted PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $SMALL CPU_REQUEST=50m  NAME=izi-x-release-small     MIN=0 MAX=17 CACHE_TIER=trusted PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
+env $COMMON $HEAVY                  NAME=izi-x-release-large     MIN=0 MAX=3  CACHE_TIER=trusted PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
 ```
 
-To change only sizing on a live pool, `helm get values` it and `helm upgrade` the same pinned
-chart with the full file — not `--reuse-values --set maxRunners=…`: the chart compares
-`minRunners` (float64 from the stored values) with the int64 from `--set` and fails.
-Changing a pool's pod template recreates its listener; on 2026-10-07 the old listener stayed
-in `Terminating` both times and the pool took no jobs until it was force-deleted
-(`kubectl -n arc-systems delete pod <release>-<hash>-listener --force --grace-period=0`).
+To change only sizing on a live pool: `helm upgrade --reuse-values --set-json maxRunners=N
+--set-json minRunners=M` with the same pinned chart. Plain `--set` fails: the chart compares
+`minRunners` (float64 from the stored values) with the int64 from `--set`.
+Changing a pool's pod template recreates its listener: the controller deletes the old one, which
+shows `Terminating` for up to its 30 s grace period, then the new one starts. That is the normal
+shutdown, not a hang (2026-10-08: `Killing` events 09:04:59–09:05:47, volumes unmounted from
+09:05:31) — no force delete.
 
 Retiring a pool — order matters, or jobs queue for 24h for a label nobody serves: change the
 workflows' `runs-on` first, wait until no queued job asks for the label, then
@@ -180,10 +236,14 @@ outage and cost ~12 hours:
 - the `AutoscalingListener` CR keeps pointing at a deleted `EphemeralRunnerSet`, so the
   listener pod crash-loops on `could not patch ephemeral runner set ... not found`;
 - the controller wedges outright (log frozen mid `deleting runner scale set`) and no listener
-  is created at all.
+  is created at all;
+- the listener pod stays Running and Ready, but after a network outage its long-poll to the
+  GitHub broker never returns again (2026-10-08: ten listeners, `Client.Timeout exceeded while
+  awaiting headers`, until their pods were recreated). A healthy listener logs
+  `Calculated target runner count` after every poll (~50 s); none in 10 minutes is a strike.
 
 The watchdog heals on the second consecutive unhealthy check — deleting the stale listener CR
-in the first case, restarting the controller in the second — and announces what it did to
+in the first case, restarting the controller in the second, deleting the listener pod in the third — and announces what it did to
 Telegram if `/etc/arc-watchdog/tg-token` (chmod 600) and `TG_CHAT=` in `/etc/arc-watchdog/config`
 are present. Without those it heals silently.
 

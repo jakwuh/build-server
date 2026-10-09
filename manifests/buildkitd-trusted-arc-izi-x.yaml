@@ -10,7 +10,7 @@
 #
 # arm64 (prod-sa) runs through the host binfmt registration (qemu-user-static, setup.sh).
 # Endpoint: tcp://buildkitd-trusted.arc-izi-x.svc.cluster.local:1234
-# Cache: hostPath /opt/buildkit-cache-izi-x-trusted, GC keeps it under ~40GB.
+# Cache: hostPath /opt/buildkit-cache-izi-x-trusted, GC keeps it under ~20GB (shared config, sizing in buildkitd-arc-izi-x.yaml).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,6 +26,7 @@ spec:
     metadata:
       labels: { app: buildkitd-trusted }
     spec:
+      priorityClassName: ci-infra
       containers:
         - name: buildkitd
           image: mirror.gcr.io/moby/buildkit:v0.30.0

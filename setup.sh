@@ -23,11 +23,49 @@ apt-get install -y -qq curl git jq ufw
 # the setup-qemu-action registration did not, and cost every job 150–270 s.
 apt-get install -y -qq qemu-user-static
 
+echo "=== Kernel and disk ==="
+# Kernel 6.8 (the 24.04 GA kernel) ran into a cgroup writeback storm under CI load on
+# 2026-10-08: 620–1900 inode_switch_wbs kworkers, load up to 785, processes stuck in D
+# state. The HWE kernel (7.0, fix of CVE-2026-64378) does not; the meta package keeps it
+# updated. --no-install-recommends: the recommends drag in firmware this VM has no use for.
+# Takes effect after a reboot.
+apt-get install -y -qq --no-install-recommends linux-generic-hwe-24.04
+# The cloud image mounts / with `discard`: every deleted block is trimmed synchronously,
+# and CI deletes all the time (work dirs, node_modules, buildkit snapshots). On
+# 2026-10-08 that was 4852 discards/s (155 MB/s) at 89% disk util. Trim in one batch a
+# day instead.
+sed -i 's#^\(LABEL=cloudimg-rootfs\s\+/\s\+ext4\s\+\)discard,#\1#' /etc/fstab
+mount -o remount,nodiscard /
+mkdir -p /etc/systemd/system/fstrim.timer.d
+cat > /etc/systemd/system/fstrim.timer.d/daily.conf << 'UNIT'
+[Timer]
+OnCalendar=
+OnCalendar=daily
+RandomizedDelaySec=1h
+UNIT
+systemctl daemon-reload
+systemctl enable --now fstrim.timer
+
 echo "=== k3s (single-node Kubernetes) ==="
 if ! command -v k3s >/dev/null 2>&1; then
   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --write-kubeconfig-mode=644" sh -
 fi
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+echo "=== containerd: volatile overlay mounts ==="
+# overlayfs syncs the upper filesystem when a container's rootfs is unmounted. On the one
+# CI disk that sync waits for everyone's writeback: on 2026-10-08 container stops hung for
+# minutes with shim threads in sync_inodes_sb / wb_wait_for_completion, and every pool
+# listener sat in Terminating until force-deleted. CI rootfs is disposable, so skip the sync
+# (overlayfs `volatile`, kernel ≥ 5.10; containerd overlayfs `mount_options`). After a host
+# crash a volatile upperdir is refused on remount — containers then get fresh snapshots.
+install -d /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d
+cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/overlay-volatile.toml << 'TOML'
+[plugins.'io.containerd.snapshotter.v1.overlayfs']
+  mount_options = ["volatile"]
+TOML
+systemctl restart k3s
+kubectl wait --for=condition=Ready node --all --timeout=180s
 
 echo "=== Control-plane reservation ==="
 # k3s — apiserver, kine and kubelet in one process — shares this box with the
@@ -138,8 +176,15 @@ curl -fsSL "$RAW/systemd/arc-prune.timer" -o /etc/systemd/system/arc-prune.timer
 # version; files nobody read for 14 days go.
 curl -fsSL "$RAW/systemd/ci-cache-prune.service" -o /etc/systemd/system/ci-cache-prune.service
 curl -fsSL "$RAW/systemd/ci-cache-prune.timer" -o /etc/systemd/system/ci-cache-prune.timer
+# Tier isolation: optional PR pods run in the idle CPU/IO tier (scripts/ci-tier-weights.sh);
+# iocost needs /etc/iocost.model, measured once on this disk (README, "Tier isolation").
+curl -fsSL "$RAW/scripts/ci-tier-weights.sh" -o /opt/build-server/ci-tier-weights.sh
+chmod +x /opt/build-server/ci-tier-weights.sh
+curl -fsSL "$RAW/systemd/ci-tier-weights.service" -o /etc/systemd/system/ci-tier-weights.service
+curl -fsSL "$RAW/systemd/iocost.service" -o /etc/systemd/system/iocost.service
 systemctl daemon-reload
 systemctl enable --now arc-watchdog.timer arc-runner-janitor.timer arc-prune.timer ci-cache-prune.timer
+systemctl enable --now iocost.service ci-tier-weights.service
 
 echo "=== CI host cache ==="
 # Tool cache and dependency caches the pools mount with CI_HOST_CACHE=true; a pool
@@ -153,6 +198,7 @@ echo "=== In-cluster helpers ==="
 # and the shared buildkitd the miraj scale-set builds against. These used to be
 # applied by hand, which is why a rebuilt box came up subtly slower.
 kubectl apply -f "$RAW/manifests/registry-cache.yaml"
+kubectl apply -f "$RAW/manifests/registry-ghcr-cache.yaml"
 kubectl apply -f "$RAW/manifests/buildkitd-arc-miraj.yaml"
 kubectl apply -f "$RAW/manifests/buildkitd-arc-izi-x.yaml"
 kubectl apply -f "$RAW/manifests/buildkitd-trusted-arc-izi-x.yaml"

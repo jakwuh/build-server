@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ARC self-heal — keeps every runner scale-set's listener alive.
 #
-# Fixes two failure modes, both observed live on 2026-08-06/07 in the wake of a
+# Fixes three failure modes, both observed live on 2026-08-06/07 in the wake of a
 # GitHub Actions outage, which together left every self-hosted pool dead for ~12h:
 #
 #   1. The AutoscalingListener CR points at an EphemeralRunnerSet that no longer
@@ -15,7 +15,10 @@
 #      set", log frozen, single AutoscalingRunnerSet worker blocked) and no
 #      listener exists at all. Attempted cure: rollout restart the controller.
 #
-# Both leave zero red checks anywhere — jobs just queue silently — so the repair
+#   3. The listener pod is Running and Ready but its broker long-poll never
+#      returns again (after a network outage, 2026-10-08). Cure: delete the pod.
+#
+# All leave zero red checks anywhere — jobs just queue silently — so the repair
 # is announced to Telegram when configured.
 #
 # The restart is not a reliable cure, and this script should not be read as one.
@@ -135,19 +138,42 @@ for i in d.get('items', []):
     fi
   fi
 
+  # A Running, Ready listener can still be deaf. Its long-poll to
+  # broker.actions.githubusercontent.com returns within ~50 s, empty or not, and every
+  # return logs "Calculated target runner count" (30 lines in 30 idle minutes, measured
+  # 2026-10-08). After bld1 lost its uplink 19:55–20:06 UTC that day, all ten listeners
+  # kept answering "Client.Timeout exceeded while awaiting headers" and never logged
+  # another one until their pods were recreated at 20:10. A fresh pod opens a new session.
+  local polling=1
   if [ "$pod_ok" = 1 ] && [ "$ref_ok" = 1 ]; then
+    local started recent
+    started=$($KC get pod "$lpod" -n arc-systems -o jsonpath='{.status.startTime}' 2>/dev/null)
+    # Read the log whole: `grep -q` on a pipe exits at the first match, kubectl dies
+    # of SIGPIPE, and under pipefail a polling listener would read as a deaf one.
+    if [ -n "$started" ] && [ $(( $(date +%s) - $(date -d "$started" +%s) )) -gt 600 ] &&
+      recent=$($KC logs "$lpod" -n arc-systems --since=10m 2>/dev/null) &&
+      [[ "$recent" != *'Calculated target runner count'* ]]; then
+      polling=0
+    fi
+  fi
+
+  if [ "$pod_ok" = 1 ] && [ "$ref_ok" = 1 ] && [ "$polling" = 1 ]; then
     rm -f "$STATE/$key"
     return 0
   fi
 
   strikes=$(( $(cat "$STATE/$key" 2>/dev/null || echo 0) + 1 ))
   echo "$strikes" > "$STATE/$key"
-  log "$ns/$name unhealthy (pod_ok=$pod_ok ref_ok=$ref_ok listener=${lpod:-none} ers_ref=${ers_ref:-none}) strike=$strikes"
+  log "$ns/$name unhealthy (pod_ok=$pod_ok ref_ok=$ref_ok polling=$polling listener=${lpod:-none} ers_ref=${ers_ref:-none}) strike=$strikes"
   [ "$strikes" -ge "$STRIKES_TO_HEAL" ] || return 0
 
   capture "$ns" "$name"
 
-  if [ "$ref_ok" = 0 ] && [ -n "$lpod" ]; then
+  if [ "$polling" = 0 ]; then
+    log "healing: deleting listener pod $lpod (no broker poll returned in 10 min)"
+    $KC delete pod "$lpod" -n arc-systems --timeout=60s
+    notify "🛠 ARC self-heal: <b>$ns/$name</b> listener was Running but got no answer from the GitHub broker for 10 min; pod recreated."
+  elif [ "$ref_ok" = 0 ] && [ -n "$lpod" ]; then
     log "healing: deleting stale AutoscalingListener $lpod (dangling ERS $ers_ref)"
     $KC delete autoscalinglistener "$lpod" -n arc-systems --timeout=60s
     notify "🛠 ARC self-heal: <b>$ns/$name</b> listener pointed at a deleted EphemeralRunnerSet (<code>$ers_ref</code>); listener CR recreated. Runners should come back within ~1 min."

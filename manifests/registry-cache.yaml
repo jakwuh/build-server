@@ -77,6 +77,7 @@ spec:
     metadata:
       labels: { app: registry }
     spec:
+      priorityClassName: ci-infra
       containers:
         - name: registry
           image: mirror.gcr.io/library/registry:2

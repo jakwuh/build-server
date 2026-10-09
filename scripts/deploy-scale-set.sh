@@ -9,7 +9,7 @@
 # the derived default: NAMESPACE, RELEASE. Plus sizing: CPU_REQUEST,
 # MEM_LIMIT, DIND_CPU_REQUEST, DIND_MEM_REQUEST, DIND_CPU_LIMIT,
 # DIND_MEM_LIMIT, REGISTRY_MIRRORS ("host1 host2", highest priority first).
-# Pod shape: PRIORITY_CLASS, DIND, DIND_EXTERNALS, CI_HOST_CACHE, WORK_SIZE, CONTAINER_MODE.
+# Pod shape: PRIORITY_CLASS, DIND, DIND_EXTERNALS, CI_HOST_CACHE, CACHE_TIER, WORK_SIZE, CONTAINER_MODE.
 #
 # Prerequisites (once per namespace):
 #   kubectl -n arc-<org> create secret docker-registry ghcr-pull \
@@ -105,6 +105,13 @@ DIND_EXTERNALS="${DIND_EXTERNALS:-true}"
 # CI_HOST_CACHE=true — mount the node-local tool cache and dependency caches
 # (scripts/install-ci-host-cache.sh) into the runner container.
 CI_HOST_CACHE="${CI_HOST_CACHE:-false}"
+# CACHE_TIER=pr|trusted — which copy of the node caches the pool mounts
+# (/opt/ci-tier/<tier>: toolcache at /opt/hostedtoolcache, dependency and test caches
+# at /ci-cache). PR code runs as the same uid as main/release jobs, so a shared copy
+# would let it replace the node/flutter binaries, pub packages or generated code that
+# trusted builds execute — the same line the two buildkitd draw. Required with
+# CI_HOST_CACHE=true and with CONTAINER_MODE.
+CACHE_TIER="${CACHE_TIER:-}"
 # CONTAINER_MODE=kubernetes-novolume — jobs with `container:`/`services:` run as a pod of
 # their own that the runner creates through the API (ARC container hooks), with images
 # from the node's containerd: they stay cached between jobs, where a dind sidecar pulled
@@ -118,6 +125,9 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 for flag in DIND DIND_EXTERNALS CI_HOST_CACHE; do
   case "${!flag}" in true|false) ;; *) echo "$flag must be true or false, got: ${!flag}" >&2; exit 1 ;; esac
 done
+if [ "$CI_HOST_CACHE" = "true" ] || [ "$CONTAINER_MODE" != "none" ]; then
+  case "$CACHE_TIER" in pr|trusted) ;; *) echo "CACHE_TIER must be pr or trusted, got: '$CACHE_TIER'" >&2; exit 1 ;; esac
+fi
 case "$CONTAINER_MODE" in
   none) ;;
   kubernetes-novolume)
@@ -158,6 +168,7 @@ minRunners: $MIN
 maxRunners: $MAX
 listenerTemplate:
   spec:
+    priorityClassName: ci-infra
     # The listener is the only thing that can accept a job from GitHub, and on a
     # single-node cluster there is nowhere to reschedule it — the default 300s
     # NoExecute tolerations only guarantee that a node blip takes the pool
@@ -188,8 +199,8 @@ CACHE_MOUNTS="
       - { mountPath: /opt/hostedtoolcache, name: toolcache }
       - { mountPath: /ci-cache,            name: ci-cache }"
 CACHE_VOLUMES="
-    - { name: toolcache, hostPath: { path: /opt/hostedtoolcache, type: Directory } }
-    - { name: ci-cache,  hostPath: { path: /opt/ci-cache,        type: Directory } }"
+    - { name: toolcache, hostPath: { path: /opt/ci-tier/$CACHE_TIER/toolcache, type: Directory } }
+    - { name: ci-cache,  hostPath: { path: /opt/ci-tier/$CACHE_TIER/cache,     type: Directory } }"
 fi
 EXTERNALS_INIT=""; EXTERNALS_MOUNT=""; EXTERNALS_VOLUME=""
 if [ "$DIND_EXTERNALS" = "true" ]; then
@@ -211,13 +222,18 @@ HOOK_ENV=""; HOOK_MOUNT=""; HOOK_VOLUME=""
 if [ "$CONTAINER_MODE" != "none" ]; then
 # The job pod's spec: the hooks merge it into the pod they create (`$job` = the job
 # container) — its limits and its node cache. Job images run as root, so their cache is
-# a tree of its own (/opt/ci-cache-containers): root-owned entries in /opt/ci-cache
-# would lock the runner-uid jobs out of it.
+# a tree of its own (/opt/ci-tier/<tier>-containers): root-owned entries in the
+# runner-uid trees would lock those jobs out of them.
+# Job images are referenced by mutable tags (izi-x e2e: `e2e-tests:dev`); without a
+# policy Kubernetes takes IfNotPresent and the node runs whatever it pulled first —
+# e2e kept the image without its spec cache for a day after it was rebuilt. Always
+# only resolves the tag's digest against the registry; unchanged layers stay in containerd.
 kubectl -n "$NS" create configmap "$RELEASE-hook-template" \
   --from-literal=template.yaml="spec:${PRIORITY_CLASS:+
   priorityClassName: $PRIORITY_CLASS}
   containers:
     - name: \$job
+      imagePullPolicy: Always
       resources:
         requests: { cpu: \"$CPU_REQUEST\", memory: $MEM_REQUEST }
         limits: { cpu: \"$CPU_LIMIT\", memory: $MEM_LIMIT }
@@ -226,7 +242,7 @@ kubectl -n "$NS" create configmap "$RELEASE-hook-template" \
       volumeMounts:
         - { mountPath: /ci-cache, name: ci-cache-containers }
   volumes:
-    - { name: ci-cache-containers, hostPath: { path: /opt/ci-cache-containers, type: Directory } }
+    - { name: ci-cache-containers, hostPath: { path: /opt/ci-tier/$CACHE_TIER-containers, type: Directory } }
 " --dry-run=client -o yaml | kubectl apply -f -
 cat >> "$OVERLAY" << YAML
 containerMode:

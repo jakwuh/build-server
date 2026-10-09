@@ -23,3 +23,28 @@ value: 2000
 preemptionPolicy: Never
 globalDefault: false
 description: CI jobs on the main branch
+---
+# Ahead of every CI job: the ARC listeners, buildkitd and the registry cache. When the
+# node's requests are full, a recreated listener (every pool upgrade recreates it) or
+# buildkitd otherwise waits Pending until some job ends — and its pool takes no jobs
+# meanwhile (2026-10-08: pr-heavy and release-large listeners, buildkitd-trusted).
+# Never preempts: it only goes first when capacity frees.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ci-infra
+value: 10000
+preemptionPolicy: Never
+globalDefault: false
+description: CI infrastructure a pool cannot work without
+---
+# Required PR checks (the merge gates' validation) ahead of optional PR jobs: on a full
+# node an optional job otherwise takes the slot a gate waits for. Below main and release.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ci-pr-required
+value: 1000
+preemptionPolicy: Never
+globalDefault: false
+description: Required checks of pull requests

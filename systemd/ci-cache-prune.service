@@ -4,4 +4,8 @@ Description=Drop files untouched for 14 days from the shared CI dependency cache
 [Service]
 Type=oneshot
 # / is mounted relatime, so atime moves at least once a day for anything read.
-ExecStart=/usr/bin/find /opt/ci-cache /opt/ci-cache-containers -type f -atime +14 -delete
+# Toolcache trees are left alone: install-ci-host-cache.sh owns them.
+ExecStart=/usr/bin/find /opt/ci-tier -path '*/toolcache' -prune -o -path '*/node_modules/*' -prune -o -type f -atime +14 -delete
+# A node_modules tree is one unit: the node-modules action touches it on every use,
+# so a tree (or a half-written .tmp of a killed job) untouched for 7 days goes whole.
+ExecStart=/usr/bin/find /opt/ci-tier -mindepth 3 -maxdepth 4 -path '*/node_modules/*' -prune -mtime +7 -exec rm -rf {} +

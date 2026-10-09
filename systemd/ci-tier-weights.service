@@ -1,0 +1,12 @@
+[Unit]
+Description=Idle CPU/IO tier for optional izi-x PR pods (scripts/ci-tier-weights.sh)
+After=k3s.service iocost.service
+Requires=k3s.service
+
+[Service]
+ExecStart=/opt/build-server/ci-tier-weights.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
